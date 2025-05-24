@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""
+Daily digest email sender for Miniflux RSS reader.
+Fetches unread entries, scores by importance, and sends HTML email digest.
+"""
+
+import os
+import sys
+import json
+import requests
+from datetime import datetime, timezone, timedelta
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from jinja2 import Template
+import math
+import html
+
+# Configuration from environment variables
+MINIFLUX_BASE_URL = os.environ.get('MINIFLUX_BASE_URL', 'http://miniflux:8080')
+MINIFLUX_API_KEY = os.environ.get('MINIFLUX_API_KEY', '')
+SMTP_HOST = os.environ.get('SMTP_HOST', '')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', 587))
+SMTP_USER = os.environ.get('SMTP_USER', '')
+SMTP_PASS = os.environ.get('SMTP_PASS', '')
+SMTP_FROM = os.environ.get('SMTP_FROM', '')
+SMTP_TO = os.environ.get('SMTP_TO', '')
+
+# Scoring weights for 注目度 (attention score)
+WEIGHT_STARS = 3.0      # Weight for starred items
+WEIGHT_BOOKMARKS = 2.0  # Weight for bookmarked items  
+WEIGHT_RECENCY = 1.0    # Weight for recent items
+
+# Number of top entries to include per category
+TOP_N_PER_CATEGORY = 5
+
+# HTML email template
+EMAIL_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Daily RSS Digest - {{ date }}</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2563eb;
+            border-bottom: 2px solid #e5e7eb;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #1f2937;
+            margin-top: 30px;
+            text-transform: capitalize;
+        }
+        .entry {
+            margin-bottom: 20px;
+            padding: 15px;
+            background-color: #f9fafb;
+            border-radius: 6px;
+            border-left: 4px solid #3b82f6;
+        }
+        .entry-title {
+            font-weight: bold;
+            font-size: 16px;
+            margin-bottom: 5px;
+        }
+        .entry-title a {
+            color: #1f2937;
+            text-decoration: none;
+        }
+        .entry-title a:hover {
+            color: #2563eb;
+        }
+        .entry-meta {
+            font-size: 12px;
+            color: #6b7280;
+            margin-bottom: 10px;
+        }
+        .entry-content {
+            color: #4b5563;
+            font-size: 14px;
+        }
+        .score {
+            display: inline-block;
+            background-color: #3b82f6;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #e5e7eb;
+            text-align: center;
+            color: #6b7280;
+            font-size: 12px;
+        }
+        .summary {
+            background-color: #eff6ff;
+            border: 1px solid #3b82f6;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        .summary h3 {
+            margin-top: 0;
+            color: #1e40af;
+        }
+        @media (max-width: 600px) {
+            body {
+                padding: 10px;
+            }
+            .container {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📰 Daily RSS Digest - {{ date }}</h1>
+        
+        <div class="summary">
+            <h3>今日のサマリー</h3>
+            <p>{{ total_entries }}件の未読記事から、注目度の高い{{ total_selected }}件を選びました。</p>
+        </div>
+        
+        {% for category, entries in categories.items() %}
+        {% if entries %}
+        <h2>{{ category }}</h2>
+        {% for entry in entries %}
+        <div class="entry">
+            <div class="entry-title">
+                <a href="{{ entry.url }}" target="_blank">{{ entry.title }}</a>
+                <span class="score">注目度: {{ "%.1f"|format(entry.score) }}</span>
+            </div>
+            <div class="entry-meta">
+                {{ entry.feed_title }} • {{ entry.published_at }}
+            </div>
+            <div class="entry-content">
+                {{ entry.content }}
+            </div>
+        </div>
+        {% endfor %}
+        {% endif %}
+        {% endfor %}
+        
+        <div class="footer">
+            <p>Generated by Miniflux Digest • {{ total_entries }} entries processed</p>
+            <p><a href="{{ miniflux_url }}">Minifluxで全ての記事を見る</a></p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+def strip_html(text):
+    """Remove HTML tags and decode HTML entities."""
+    # Simple HTML tag removal
+    import re
+    text = re.sub('<[^<]+?>', '', text)
+    # Decode HTML entities
+    text = html.unescape(text)
+    return text.strip()
+
+def truncate_text(text, length=200):
+    """Truncate text to specified length."""
+    text = strip_html(text)
+    if len(text) <= length:
+        return text
+    return text[:length].rsplit(' ', 1)[0] + '...'
+
+def calculate_score(entry, now):
+    """
+    Calculate attention score (注目度) for an entry.
+    Score = w1*stars + w2*bookmarks + w3*recency
+    """
+    score = 0.0
+    
+    # Check if entry is starred
+    if entry.get('starred', False):
+        score += WEIGHT_STARS
+    
+    # Check if entry is bookmarked (saved)
+    if entry.get('saved', False):
+        score += WEIGHT_BOOKMARKS
+    
+    # Calculate recency score (0-1, where 1 is most recent)
+    try:
+        published = datetime.fromisoformat(entry['published_at'].replace('Z', '+00:00'))
+        hours_old = (now - published).total_seconds() / 3600
+        recency_score = math.exp(-hours_old / 24)  # Exponential decay over 24 hours
+        score += WEIGHT_RECENCY * recency_score
+    except:
+        # If date parsing fails, give a small recency score
+        score += WEIGHT_RECENCY * 0.1
+    
+    return score
+
+def fetch_unread_entries():
+    """Fetch unread entries from Miniflux API."""
+    headers = {
+        'X-Auth-Token': MINIFLUX_API_KEY,
+        'Content-Type': 'application/json'
+    }
+    
+    # Get entries from last 24 hours
+    now = datetime.now(timezone.utc)
+    yesterday = now - timedelta(days=1)
+    
+    params = {
+        'status': 'unread',
+        'after': int(yesterday.timestamp()),
+        'limit': 1000,
+        'order': 'published_at',
+        'direction': 'desc'
+    }
+    
+    try:
+        response = requests.get(
+            f"{MINIFLUX_BASE_URL}/v1/entries",
+            headers=headers,
+            params=params
+        )
+        response.raise_for_status()
+        data = response.json()
+        entries = data.get('entries', [])
+        print(f"Fetched {len(entries)} unread entries from the last 24 hours")
+        return entries
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP error fetching entries: {e}", file=sys.stderr)
+        print(f"Response: {e.response.text}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error fetching entries: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def get_feed_categories():
+    """Get feed to category mapping from Miniflux."""
+    headers = {
+        'X-Auth-Token': MINIFLUX_API_KEY,
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        response = requests.get(
+            f"{MINIFLUX_BASE_URL}/v1/feeds",
+            headers=headers
+        )
+        response.raise_for_status()
+        feeds = response.json()
+        
+        # Create feed_id to category mapping
+        feed_categories = {}
+        for feed in feeds:
+            feed_categories[feed['id']] = feed.get('category', {}).get('title', 'uncategorized').lower()
+        
+        return feed_categories
+    except Exception as e:
+        print(f"Error fetching feed categories: {e}", file=sys.stderr)
+        return {}
+
+def categorize_entries(entries):
+    """Categorize entries based on their feed's category."""
+    # Get feed to category mapping
+    feed_categories = get_feed_categories()
+    
+    categories = {
+        'papers': [],
+        'tech': [],
+        'business': [],
+        'uncategorized': []
+    }
+    
+    for entry in entries:
+        feed_id = entry.get('feed_id')
+        category = feed_categories.get(feed_id, 'uncategorized')
+        
+        # Ensure category exists in our dict
+        if category not in categories:
+            category = 'uncategorized'
+        
+        categories[category].append(entry)
+    
+    # Remove uncategorized if empty
+    if not categories['uncategorized']:
+        del categories['uncategorized']
+    
+    return categories
+
+def prepare_email_data(categories):
+    """Prepare data for email template."""
+    now = datetime.now(timezone.utc)
+    email_categories = {}
+    total_entries = 0
+    total_selected = 0
+    
+    for category, entries in categories.items():
+        # Calculate scores for all entries
+        scored_entries = []
+        for entry in entries:
+            score = calculate_score(entry, now)
+            
+            # Parse and format the date
+            try:
+                published = datetime.fromisoformat(entry['published_at'].replace('Z', '+00:00'))
+                published_str = published.strftime('%Y-%m-%d %H:%M JST')
+            except:
+                published_str = entry.get('published_at', 'Unknown date')
+            
+            scored_entry = {
+                'title': entry.get('title', 'Untitled'),
+                'url': entry.get('url', '#'),
+                'feed_title': entry.get('feed', {}).get('title', 'Unknown Feed'),
+                'published_at': published_str,
+                'content': truncate_text(entry.get('content', '')),
+                'score': score
+            }
+            scored_entries.append(scored_entry)
+        
+        # Sort by score and take top N
+        scored_entries.sort(key=lambda x: x['score'], reverse=True)
+        selected_entries = scored_entries[:TOP_N_PER_CATEGORY]
+        
+        if selected_entries:
+            email_categories[category] = selected_entries
+            total_selected += len(selected_entries)
+        
+        total_entries += len(entries)
+    
+    return {
+        'categories': email_categories,
+        'date': datetime.now().strftime('%Y-%m-%d'),
+        'total_entries': total_entries,
+        'total_selected': total_selected,
+        'miniflux_url': MINIFLUX_BASE_URL.replace(':8080', ':2222')  # Adjust for external access
+    }
+
+def send_email(subject, html_content):
+    """Send email via SMTP."""
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = SMTP_FROM
+    msg['To'] = SMTP_TO
+    
+    # Attach HTML content
+    html_part = MIMEText(html_content, 'html', 'utf-8')
+    msg.attach(html_part)
+    
+    try:
+        # Connect to SMTP server
+        print(f"Connecting to SMTP server {SMTP_HOST}:{SMTP_PORT}...")
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        print(f"Email sent successfully to {SMTP_TO}")
+        return True
+    except Exception as e:
+        print(f"Error sending email: {e}", file=sys.stderr)
+        return False
+
+def test_api_connection():
+    """Test if API is accessible."""
+    headers = {
+        'X-Auth-Token': MINIFLUX_API_KEY,
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        response = requests.get(
+            f"{MINIFLUX_BASE_URL}/v1/me",
+            headers=headers,
+            timeout=5
+        )
+        response.raise_for_status()
+        user = response.json()
+        print(f"Connected to Miniflux as user: {user['username']}")
+        return True
+    except Exception as e:
+        print(f"Error connecting to Miniflux API: {e}", file=sys.stderr)
+        return False
+
+def main():
+    """Main function to orchestrate digest generation and sending."""
+    # Validate configuration
+    if not all([MINIFLUX_API_KEY, SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM, SMTP_TO]):
+        print("Error: Missing required environment variables", file=sys.stderr)
+        print("Required: MINIFLUX_API_KEY, SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM, SMTP_TO", file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"Starting digest generation at {datetime.now()}")
+    
+    # Test API connection
+    if not test_api_connection():
+        sys.exit(1)
+    
+    # Fetch unread entries
+    entries = fetch_unread_entries()
+    
+    if not entries:
+        print("No unread entries found, skipping email")
+        sys.exit(0)
+    
+    # Categorize entries
+    categories = categorize_entries(entries)
+    
+    # Prepare email data
+    email_data = prepare_email_data(categories)
+    
+    # Generate HTML email
+    template = Template(EMAIL_TEMPLATE)
+    html_content = template.render(**email_data)
+    
+    # Send email
+    subject = f"Daily RSS Digest - {email_data['date']} ({email_data['total_selected']}件の注目記事)"
+    if send_email(subject, html_content):
+        print(f"Successfully sent digest with {email_data['total_selected']} articles from {email_data['total_entries']} total entries")
+        sys.exit(0)
+    else:
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

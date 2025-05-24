@@ -1,0 +1,86 @@
+# docker-compose.yml
+services:
+  # PostgreSQL データベース（Miniflux用）
+  postgres:
+    image: postgres:16-alpine
+    container_name: miniflux-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-miniflux}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-miniflux}
+    volumes:
+      - miniflux-db:/var/lib/postgresql/data
+    networks:
+      - miniflux-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-miniflux}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Miniflux RSSリーダーサービス
+  miniflux:
+    image: miniflux/miniflux:latest
+    container_name: miniflux-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "2222:8080"  # Minifluxのデフォルトポートは8080
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-miniflux}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-miniflux}?sslmode=disable
+      RUN_MIGRATIONS: 1
+      CREATE_ADMIN: 1
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme}
+      # カスタムCSS設定（新しい方法）
+      CUSTOM_CSS_PATH: /var/lib/miniflux/custom.css
+    volumes:
+      # カスタムテーマをマウント
+      - ./miniflux-theme-card.css:/var/lib/miniflux/custom.css:ro
+    networks:
+      - miniflux-net
+    healthcheck:
+      test: ["CMD", "miniflux", "-healthcheck", "auto"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 毎日のダイジェストメール送信用Cronサイドカー
+  digest-cron:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: miniflux-digest
+    depends_on:
+      miniflux:
+        condition: service_healthy
+    environment:
+      # Miniflux API設定
+      MINIFLUX_BASE_URL: http://miniflux:8080
+      MINIFLUX_API_KEY: ${MINIFLUX_API_KEY}
+      # メール送信用SMTP設定
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      SMTP_FROM: ${SMTP_FROM}
+      SMTP_TO: ${SMTP_TO}
+      # Cronのタイムゾーン（JST）
+      TZ: Asia/Tokyo
+    volumes:
+      # スクリプトを共有
+      - ./send_digest.py:/app/send_digest.py:ro
+      - ./bootstrap_feeds.py:/app/bootstrap_feeds.py:ro
+      - ./wait-for-api.sh:/app/wait-for-api.sh:ro
+    networks:
+      - miniflux-net
+    command: ["/bin/sh", "-c", "/app/wait-for-api.sh && crond -f -d 8 & tail -f /var/log/cron.log"]
+
+networks:
+  miniflux-net:
+    driver: bridge
+
+volumes:
+  miniflux-db:
+    name: miniflux-postgres-data

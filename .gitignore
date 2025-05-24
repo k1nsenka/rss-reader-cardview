@@ -1,85 +1,42 @@
-# .gitignore
-
-# 環境変数ファイル（機密情報を含む）
+# Environment variables
 .env
 .env.local
 .env.*.local
 
-# ログファイル
-cron-logs/
-*.log
-logs/
-*.log.*
+# Credentials
+admin-credentials.txt
+*.pem
+*.key
 
-# データベースボリューム（ローカルマウントの場合）
-data/
-db-data/
-postgres-data/
-
-# バックアップファイル
+# Backups
 *.sql
-*.dump
 *.tar.gz
-*.zip
-backup/
+backup_*
 backups/
 
-# IDEとエディタ設定
-.idea/
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
 .vscode/
+.idea/
 *.swp
 *.swo
-*~
-.DS_Store
 
-# Python関連
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
 venv/
-ENV/
-.venv
-pip-log.txt
-pip-delete-this-directory.txt
+env/
 
-# 一時ファイル
-*.tmp
-*.temp
-*.bak
-*.cache
-tmp/
-temp/
-
-# Docker関連（ローカルビルドキャッシュ）
-.docker/
-
-# OS生成ファイル
-Thumbs.db
-Desktop.ini
-.Spotlight-V100
-.Trashes
-
-# テスト関連
-.coverage
-.pytest_cache/
-htmlcov/
-.tox/
-
-# ドキュメントビルド
-docs/_build/
-site/
-
-# 機密情報を含む可能性のあるファイル
-*.key
-*.pem
-*.crt
-*.p12
-secrets/
-credentials/
-
-# カスタム設定（ローカル開発用）
-docker-compose.override.yml
-config.local.yml
+# Docker volumes (if mounted locally)
+data/
+postgres-data/
